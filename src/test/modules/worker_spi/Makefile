@@ -16,3 +16,5 @@ top_builddir = ../../../..
 include $(top_builddir)/src/Makefile.global
 include $(top_srcdir)/contrib/contrib-global.mk
 endif
+
+override CPPFLAGS += -O0 -g -I$(top_builddir)/src/backend/statestore

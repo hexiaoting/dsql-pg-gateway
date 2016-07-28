@@ -41,6 +41,8 @@
 #include "utils/snapmgr.h"
 #include "tcop/utility.h"
 
+int start_subscribe(char *port);
+
 PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(worker_spi_launch);
@@ -54,14 +56,6 @@ static volatile sig_atomic_t got_sigterm = false;
 
 /* GUC variables */
 static int	worker_spi_naptime = 10;
-static int	worker_spi_total_workers = 2;
-
-
-typedef struct worktable
-{
-	const char *schema;
-	const char *name;
-} worktable;
 
 /*
  * Signal handler for SIGTERM
@@ -77,6 +71,7 @@ worker_spi_sigterm(SIGNAL_ARGS)
 	SetLatch(MyLatch);
 
 	errno = save_errno;
+  exit(1);
 }
 
 /*
@@ -100,7 +95,7 @@ worker_spi_sighup(SIGNAL_ARGS)
  * already exist.
  */
 static void
-initialize_worker_spi(worktable *table)
+initialize_worker_spi()
 {
 	int			ret;
 	int			ntup;
@@ -115,8 +110,7 @@ initialize_worker_spi(worktable *table)
 
 	/* XXX could we use CREATE SCHEMA IF NOT EXISTS? */
 	initStringInfo(&buf);
-	appendStringInfo(&buf, "select count(*) from pg_namespace where nspname = '%s'",
-					 table->schema);
+	appendStringInfo(&buf, "select count(*) from pg_namespace ");
 
 	ret = SPI_execute(buf.data, true, 0);
 	if (ret != SPI_OK_SELECT)
@@ -131,27 +125,6 @@ initialize_worker_spi(worktable *table)
 	if (isnull)
 		elog(FATAL, "null result");
 
-	if (ntup == 0)
-	{
-		resetStringInfo(&buf);
-		appendStringInfo(&buf,
-						 "CREATE SCHEMA \"%s\" "
-						 "CREATE TABLE \"%s\" ("
-			   "		type text CHECK (type IN ('total', 'delta')), "
-						 "		value	integer)"
-				  "CREATE UNIQUE INDEX \"%s_unique_total\" ON \"%s\" (type) "
-						 "WHERE type = 'total'",
-					   table->schema, table->name, table->name, table->name);
-
-		/* set statement start time */
-		SetCurrentStatementStartTimestamp();
-
-		ret = SPI_execute(buf.data, false, 0);
-
-		if (ret != SPI_OK_UTILITY)
-			elog(FATAL, "failed to create my schema");
-	}
-
 	SPI_finish();
 	PopActiveSnapshot();
 	CommitTransactionCommand();
@@ -161,15 +134,8 @@ initialize_worker_spi(worktable *table)
 void
 worker_spi_main(Datum main_arg)
 {
-	int			index = DatumGetInt32(main_arg);
-	worktable  *table;
+	char*   port = DatumGetCString(main_arg);
 	StringInfoData buf;
-	char		name[20];
-
-	table = palloc(sizeof(worktable));
-	sprintf(name, "schema%d", index);
-	table->schema = pstrdup(name);
-	table->name = pstrdup("counted");
 
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGHUP, worker_spi_sighup);
@@ -181,118 +147,31 @@ worker_spi_main(Datum main_arg)
 	/* Connect to our database */
 	BackgroundWorkerInitializeConnection("postgres", NULL);
 
-	elog(LOG, "%s initialized with %s.%s",
-		 MyBgworkerEntry->bgw_name, table->schema, table->name);
-	initialize_worker_spi(table);
-
-	/*
-	 * Quote identifiers passed to us.  Note that this must be done after
-	 * initialize_worker_spi, because that routine assumes the names are not
-	 * quoted.
-	 *
-	 * Note some memory might be leaked here.
-	 */
-	table->schema = quote_identifier(table->schema);
-	table->name = quote_identifier(table->name);
+	initialize_worker_spi();
 
 	initStringInfo(&buf);
-	appendStringInfo(&buf,
-					 "WITH deleted AS (DELETE "
-					 "FROM %s.%s "
-					 "WHERE type = 'delta' RETURNING value), "
-					 "total AS (SELECT coalesce(sum(value), 0) as sum "
-					 "FROM deleted) "
-					 "UPDATE %s.%s "
-					 "SET value = %s.value + total.sum "
-					 "FROM total WHERE type = 'total' "
-					 "RETURNING %s.value",
-					 table->schema, table->name,
-					 table->schema, table->name,
-					 table->name,
-					 table->name);
 
-	/*
-	 * Main loop: do this until the SIGTERM handler tells us to terminate
-	 */
+  start_subscribe(port);
+
 	while (!got_sigterm)
 	{
-		int			ret;
 		int			rc;
 
-		/*
-		 * Background workers mustn't call usleep() or any direct equivalent:
-		 * instead, they may wait on their process latch, which sleeps as
-		 * necessary, but is awakened if postmaster dies.  That way the
-		 * background process goes away immediately in an emergency.
-		 */
 		rc = WaitLatch(MyLatch,
 					   WL_LATCH_SET | WL_TIMEOUT | WL_POSTMASTER_DEATH,
 					   worker_spi_naptime * 1000L);
 		ResetLatch(MyLatch);
 
-		/* emergency bailout if postmaster has died */
-		if (rc & WL_POSTMASTER_DEATH)
-			proc_exit(1);
+    if (rc & WL_POSTMASTER_DEATH) {
+      proc_exit(1);
+    }
 
-		/*
-		 * In case of a SIGHUP, just reload the configuration.
-		 */
-		if (got_sighup)
-		{
-			got_sighup = false;
-			ProcessConfigFile(PGC_SIGHUP);
-		}
+    if (got_sighup)
+    {
+      got_sighup = false;
+      ProcessConfigFile(PGC_SIGHUP);
+    }
 
-		/*
-		 * Start a transaction on which we can run queries.  Note that each
-		 * StartTransactionCommand() call should be preceded by a
-		 * SetCurrentStatementStartTimestamp() call, which sets both the time
-		 * for the statement we're about the run, and also the transaction
-		 * start time.  Also, each other query sent to SPI should probably be
-		 * preceded by SetCurrentStatementStartTimestamp(), so that statement
-		 * start time is always up to date.
-		 *
-		 * The SPI_connect() call lets us run queries through the SPI manager,
-		 * and the PushActiveSnapshot() call creates an "active" snapshot
-		 * which is necessary for queries to have MVCC data to work on.
-		 *
-		 * The pgstat_report_activity() call makes our activity visible
-		 * through the pgstat views.
-		 */
-		SetCurrentStatementStartTimestamp();
-		StartTransactionCommand();
-		SPI_connect();
-		PushActiveSnapshot(GetTransactionSnapshot());
-		pgstat_report_activity(STATE_RUNNING, buf.data);
-
-		/* We can now execute queries via SPI */
-		ret = SPI_execute(buf.data, false, 0);
-
-		if (ret != SPI_OK_UPDATE_RETURNING)
-			elog(FATAL, "cannot select from table %s.%s: error code %d",
-				 table->schema, table->name, ret);
-
-		if (SPI_processed > 0)
-		{
-			bool		isnull;
-			int32		val;
-
-			val = DatumGetInt32(SPI_getbinval(SPI_tuptable->vals[0],
-											  SPI_tuptable->tupdesc,
-											  1, &isnull));
-			if (!isnull)
-				elog(LOG, "%s: count in %s.%s is now %d",
-					 MyBgworkerEntry->bgw_name,
-					 table->schema, table->name, val);
-		}
-
-		/*
-		 * And finish our transaction.
-		 */
-		SPI_finish();
-		PopActiveSnapshot();
-		CommitTransactionCommand();
-		pgstat_report_activity(STATE_IDLE, NULL);
 	}
 
 	proc_exit(1);
@@ -308,37 +187,10 @@ void
 _PG_init(void)
 {
 	BackgroundWorker worker;
-	unsigned int i;
-
-	/* get the configuration */
-	DefineCustomIntVariable("worker_spi.naptime",
-							"Duration between each check (in seconds).",
-							NULL,
-							&worker_spi_naptime,
-							10,
-							1,
-							INT_MAX,
-							PGC_SIGHUP,
-							0,
-							NULL,
-							NULL,
-							NULL);
+  char *port;
 
 	if (!process_shared_preload_libraries_in_progress)
 		return;
-
-	DefineCustomIntVariable("worker_spi.total_workers",
-							"Number of workers.",
-							NULL,
-							&worker_spi_total_workers,
-							2,
-							1,
-							100,
-							PGC_POSTMASTER,
-							0,
-							NULL,
-							NULL,
-							NULL);
 
 	/* set up common data for all our workers */
 	worker.bgw_flags = BGWORKER_SHMEM_ACCESS |
@@ -351,13 +203,11 @@ _PG_init(void)
 	/*
 	 * Now fill in worker-specific data, and do the actual registrations.
 	 */
-	for (i = 1; i <= worker_spi_total_workers; i++)
-	{
-		snprintf(worker.bgw_name, BGW_MAXLEN, "worker %d", i);
-		worker.bgw_main_arg = Int32GetDatum(i);
+  port = (char *)GetConfigOption("port", false, false);
+  snprintf(worker.bgw_name, BGW_MAXLEN, "worker %s", port);
+  worker.bgw_main_arg = CStringGetDatum(port);//Int32GetDatum(45432);
 
-		RegisterBackgroundWorker(&worker);
-	}
+  RegisterBackgroundWorker(&worker);
 }
 
 /*
