@@ -138,10 +138,9 @@ char *getRandomDsqlIp()
   return "localhost";
 }
 
-void connect_dsqld()
+void connect_dsqld(int port)
 {
   char *ip = getRandomDsqlIp();
-  int port = 21000;
   client = new DsqlClient(ip, port);
 }
 char *request_remote(char *request)

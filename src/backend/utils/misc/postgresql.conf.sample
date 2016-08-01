@@ -628,3 +628,8 @@
 #------------------------------------------------------------------------------
 
 # Add settings for extensions here
+
+# dsqld_port = 21000
+# statestored_port = 24000
+# heartbeat_port = 23021
+# statestored_host = 'localhost'

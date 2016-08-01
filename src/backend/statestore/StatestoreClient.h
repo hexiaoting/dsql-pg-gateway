@@ -15,7 +15,6 @@
 #include "CatalogObjects_types.h"
 #include "tool.h"
 #include "thrift-server.h"
-#define HEARTBEAT_PORT 23021
 
 
 using namespace std;
@@ -40,7 +39,7 @@ class StatestoreClient{
     boost::shared_ptr<ThriftServer> heartbeat_server_;
     StatestoreServiceClient *ss_client;
     boost::shared_ptr<TTransport> transport;
-    static char *pg_port;
+    static int pg_port;
 
     // Dsqld members
     typedef boost::unordered_map<std::string, TBackendDescriptor> BackendDescriptorMap;
@@ -50,7 +49,7 @@ class StatestoreClient{
 
     typedef std::map<TopicId, TTopicDelta> TopicDeltaMap;
 
-    void Register();
+    void Register(int hb_port);
 
     void UpdateState(const TopicDeltaMap& incoming_topic_deltas);
 
@@ -70,12 +69,12 @@ class StatestoreClient{
 
     void process_query(const char *dbname, char *query);
 
-    void SetPort(char *port);
+    void SetPort(int port);
 
     void wait_postgres_start();
 
 };
 extern "C" {
-  void start_subscribe(char *port);
+  void start_subscribe(int pg_port, int ss_port, int hb_port, char *ss_host);
 }
 #endif

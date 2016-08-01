@@ -435,6 +435,10 @@ char	   *application_name;
 int			tcp_keepalives_idle;
 int			tcp_keepalives_interval;
 int			tcp_keepalives_count;
+int     dsqld_port;
+int     statestored_port;
+int     heartbeat_port;
+char    *statestored_host;
 
 /*
  * SSL renegotiation was been removed in PostgreSQL 9.5, but we tolerate it
@@ -2674,6 +2678,36 @@ static struct config_int ConfigureNamesInt[] =
 		NULL, NULL, NULL
 	},
 
+	{
+		{"dsqld_port", PGC_POSTMASTER, CUSTOM_OPTIONS,
+			gettext_noop("Sets the DSQL port the server listens on."),
+			NULL
+		},
+		&dsqld_port,
+		21000, 1, 65535,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"statestored_port", PGC_POSTMASTER, CUSTOM_OPTIONS,
+			gettext_noop("Sets the statestored port the server listens on."),
+			NULL
+		},
+		&statestored_port,
+		24000, 1, 65535,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"heartbeat_port", PGC_POSTMASTER, CUSTOM_OPTIONS,
+			gettext_noop("Sets the heartbeat port the server listens on."),
+			NULL
+		},
+		&heartbeat_port,
+		23021, 1, 65535,
+		NULL, NULL, NULL
+	},
+
 	/* End-of-list marker */
 	{
 		{NULL, 0, 0, NULL, NULL}, NULL, 0, 0, 0, NULL, NULL, NULL
@@ -2824,6 +2858,16 @@ static struct config_real ConfigureNamesReal[] =
 
 static struct config_string ConfigureNamesString[] =
 {
+	{
+		{"statestored_host", PGC_POSTMASTER, CUSTOM_OPTIONS,
+			gettext_noop("Sets the statestored host."),
+			NULL
+		},
+		&statestored_host,
+		"localhost",
+		NULL, NULL, NULL
+	},
+
 	{
 		{"archive_command", PGC_SIGHUP, WAL_ARCHIVING,
 			gettext_noop("Sets the shell command that will be called to archive a WAL file."),

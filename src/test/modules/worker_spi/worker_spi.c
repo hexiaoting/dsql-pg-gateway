@@ -40,8 +40,9 @@
 #include "utils/builtins.h"
 #include "utils/snapmgr.h"
 #include "tcop/utility.h"
+#include <stdlib.h>
 
-int start_subscribe(char *port);
+void start_subscribe(int pg_port, int ss_port, int hb_port, char *ss_host);
 
 PG_MODULE_MAGIC;
 
@@ -134,7 +135,6 @@ initialize_worker_spi()
 void
 worker_spi_main(Datum main_arg)
 {
-	char*   port = DatumGetCString(main_arg);
 	StringInfoData buf;
 
 	/* Establish signal handlers before unblocking signals. */
@@ -151,7 +151,11 @@ worker_spi_main(Datum main_arg)
 
 	initStringInfo(&buf);
 
-  start_subscribe(port);
+  int pg_port = atoi((char *)GetConfigOption("port", false, false));
+  int statestored_port = atoi((char *)GetConfigOption("statestored_port", false, false));
+  int heartbeat_port = atoi((char *)GetConfigOption("heartbeat_port", false, false));
+  char *ss_host = GetConfigOption("statestored_host", false, false);
+  start_subscribe(pg_port, statestored_port, heartbeat_port, ss_host);
 
 	while (!got_sigterm)
 	{
@@ -187,7 +191,6 @@ void
 _PG_init(void)
 {
 	BackgroundWorker worker;
-  char *port;
 
 	if (!process_shared_preload_libraries_in_progress)
 		return;
@@ -203,9 +206,8 @@ _PG_init(void)
 	/*
 	 * Now fill in worker-specific data, and do the actual registrations.
 	 */
-  port = (char *)GetConfigOption("port", false, false);
-  snprintf(worker.bgw_name, BGW_MAXLEN, "worker %s", port);
-  worker.bgw_main_arg = CStringGetDatum(port);//Int32GetDatum(45432);
+  snprintf(worker.bgw_name, BGW_MAXLEN, "worker meta sync");
+  worker.bgw_main_arg = NULL;
 
   RegisterBackgroundWorker(&worker);
 }

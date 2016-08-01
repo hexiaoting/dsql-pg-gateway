@@ -4129,7 +4129,8 @@ bool substr(char *query, char *tmp){
 }
 
 void connect_usedb(char *dbname) {
-  connect_dsqld();
+  int port = atoi((char *)GetConfigOption("dsqld_port", false, false));
+  connect_dsqld(port);
   if (dbname != NULL) {
     char usedb[30] = "use ";
     strcat(usedb, dbname);

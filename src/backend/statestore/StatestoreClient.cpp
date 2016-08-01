@@ -45,11 +45,11 @@ StatestoreClient::StatestoreClient(char *ip, int port):
     }
   }
 
-char *StatestoreClient::pg_port = "5432";
-void StatestoreClient::Register() {
+int StatestoreClient::pg_port = 5432;
+void StatestoreClient::Register(int hb_port) {
   boost::shared_ptr<TProcessor> processor(new StatestoreSubscriberProcessor(thrift_iface_));
 
-  TNetworkAddress subscriber_address =  MakeNetworkAddress("localhost", HEARTBEAT_PORT);
+  TNetworkAddress subscriber_address =  MakeNetworkAddress("localhost", hb_port);
   TRegisterSubscriberRequest request;
   request.topic_registrations.reserve(1);
   TTopicRegistration thrift_topic;
@@ -65,7 +65,7 @@ void StatestoreClient::Register() {
   request.subscriber_id = "pg";
   TRegisterSubscriberResponse response;
   ss_client->RegisterSubscriber(response, request);
-  heartbeat_server_.reset(new ThriftServer("StatestoreClient", processor, HEARTBEAT_PORT));
+  heartbeat_server_.reset(new ThriftServer("StatestoreClient", processor, hb_port));
   cout << "start thread " << endl;
   heartbeat_server_->Start();
 }
@@ -346,7 +346,7 @@ void StatestoreClient::UpdateCatalogTopicCallback(
   return ;
 }
 
-void StatestoreClient::SetPort(char *port)
+void StatestoreClient::SetPort(int port)
 {
   pg_port = port;
 }
@@ -356,10 +356,10 @@ void StatestoreClient::Heartbeat()
 }
 
 StatestoreClient* subscriber_client;
-void start_subscribe(char *port)
+void start_subscribe(int pg_port, int ss_port, int hb_port, char *ss_host)
 {
-  cout << "subscriber port=" << port;
-  subscriber_client = new StatestoreClient("nobida141", 24000);
-  subscriber_client->SetPort(port);
-  subscriber_client->Register();
+  cout << "subscriber port=" << pg_port << "ss_port=" << ss_port << "  hb_port=" << hb_port;
+  subscriber_client = new StatestoreClient(ss_host, ss_port);
+  subscriber_client->SetPort(pg_port);
+  subscriber_client->Register(hb_port);
 }
