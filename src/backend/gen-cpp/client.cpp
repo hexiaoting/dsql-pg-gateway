@@ -10,6 +10,8 @@
 
 #include "BeeswaxService.h"
 #include "beeswax_types.h"
+#include "ImpalaService.h"
+#include "ImpalaService_types.h"
 
 using namespace apache::thrift;
 using namespace apache::thrift::protocol;
@@ -18,10 +20,11 @@ using namespace apache::thrift::transport;
 using namespace std;
 using namespace boost;
 using namespace beeswax;
+using namespace impala;
 
 class DsqlClient{
 protected:
-  BeeswaxServiceClient *client;
+  ImpalaServiceClient *client;
   boost::shared_ptr<TTransport> transport;
   QueryHandle qhandle;
 
@@ -31,7 +34,7 @@ public:
       boost::shared_ptr<TTransport> socket(new TSocket(ip, port));
       transport = (boost::shared_ptr<TTransport>)new TBufferedTransport(socket);
       boost::shared_ptr<TProtocol> protocol(new TBinaryProtocol(transport));
-      client = new BeeswaxServiceClient(protocol);
+      client = new ImpalaServiceClient(protocol);
       transport->open();
     } catch (...)
     {
@@ -100,6 +103,17 @@ public:
 
   void close_connection() {
     transport->close();
+  }
+
+  int64_t close_insert() {
+    int64_t rows = 0;
+    TInsertResult result;
+    client->CloseInsert(result, qhandle);
+    map <string, int64_t>::iterator it;
+    for (it = result.rows_appended.begin( ); it != result.rows_appended.end( ); it++ ) {
+      rows += it->second;
+    }
+    return rows;
   }
 };
 
@@ -246,6 +260,11 @@ void convert(char *data, int length, char **values, int nattrs) {
       idx++;
     }
   }
+}
+
+int get_insert_rows()
+{
+  return client->close_insert();
 }
 
 }

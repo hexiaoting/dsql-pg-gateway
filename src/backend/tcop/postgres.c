@@ -919,45 +919,132 @@ int convert_type(char *type) {
   }
 }
 
-void get_dsql_result(DestReceiver *receiver)
+void get_dsql_result(Portal portal, DestReceiver *receiver, char *completionTag)
 {
-  // process dsql result
-  int nattrs = get_cols_num();
-  TupleDesc tupleDesc = CreateTemplateTupleDesc(nattrs, false);
-  int i;
+  /* Initialize completion tag to empty string */
+  if (completionTag)
+    completionTag[0] = '\0';
 
-  int bytes = 0, tupleLength = 1024;;
-  MemoryContext oldcontext = MemoryContextSwitchTo(dsql_context);
-  char *colName = MemoryContextAllocZero(dsql_context, nattrs * 32);
-  char *colType = MemoryContextAllocZero(dsql_context, nattrs * 20);
-  char **values = MemoryContextAllocZero(dsql_context, nattrs * sizeof(char *));
-  char *data = (char *)palloc(tupleLength);
-  if(!get_column_name(colName) || !get_type_name(colType))
-    ereport(ERROR,
-        (errcode(ERRCODE_UNDEFINED_DATABASE),
-         errmsg("the size of column name or type is exceed.")));
-  for (i = 1; i <= nattrs; i++)
-    TupleDescInitEntry(tupleDesc, (AttrNumber) i, &colName[(i - 1) * 32], convert_type(&colType[(i - 1) * 20]), -1, 0) ;
-  AttInMetadata *attinmeta = TupleDescGetAttInMetadata(tupleDesc);
-  TupleTableSlot* tupleTableSlot = MakeSingleTupleTableSlot(tupleDesc);
-  (*receiver->rStartup) (receiver, CMD_SELECT, tupleDesc);
+  int i, es_processed = 0;
+  ListCell   *stmtlist_item;
+  CmdType operation ;
 
-  while (bytes = get_line(tupleLength, data)) {
-    if (bytes > tupleLength) {
-      tupleLength *= 2;
-      data = (char *)palloc(tupleLength);
-    } else {
-      convert(data, bytes, values, nattrs);
-      HeapTuple heapTuple = BuildTupleFromCStrings(attinmeta, values); // result.data is a string type , but we need char **values)
-      MinimalTuple minTuple = minimal_tuple_from_heap_tuple(heapTuple);
-      ExecStoreMinimalTuple(minTuple, tupleTableSlot, true);
-      (*receiver->receiveSlot) (tupleTableSlot, receiver);
+  foreach(stmtlist_item, portal->stmts)
+  {
+    Node     *stmt = (Node *) lfirst(stmtlist_item);
+    if (IsA(stmt, PlannedStmt) &&
+        ((PlannedStmt *) stmt)->utilityStmt == NULL)
+    {
+      /*
+       * process a plannable query.
+       */
+      PlannedStmt *pstmt = (PlannedStmt *) stmt;
+      operation = pstmt->commandType;
+      break;
+    }
+  }
+  if (operation == CMD_INSERT) {
+    es_processed = get_insert_rows();
+  } else {
+    // process dsql result
+    int nattrs = get_cols_num();
+    TupleDesc tupleDesc = CreateTemplateTupleDesc(nattrs, false);
+    int bytes = 0, tupleLength = 1024;;
+    MemoryContext oldcontext = MemoryContextSwitchTo(dsql_context);
+    char *colName = MemoryContextAllocZero(dsql_context, nattrs * 32);
+    char *colType = MemoryContextAllocZero(dsql_context, nattrs * 20);
+    char **values = MemoryContextAllocZero(dsql_context, nattrs * sizeof(char *));
+    char *data = (char *)palloc(tupleLength);
+    if(!get_column_name(colName) || !get_type_name(colType))
+      ereport(ERROR,
+          (errcode(ERRCODE_UNDEFINED_DATABASE),
+           errmsg("the size of column name or type is exceed.")));
+    for (i = 1; i <= nattrs; i++)
+      TupleDescInitEntry(tupleDesc, (AttrNumber) i, &colName[(i - 1) * 32], convert_type(&colType[(i - 1) * 20]), -1, 0) ;
+    AttInMetadata *attinmeta = TupleDescGetAttInMetadata(tupleDesc);
+    TupleTableSlot* tupleTableSlot = MakeSingleTupleTableSlot(tupleDesc);
+    (*receiver->rStartup) (receiver, operation, tupleDesc);
+
+    while (bytes = get_line(tupleLength, data)) {
+      if (bytes > tupleLength) {
+        tupleLength *= 2;
+        data = (char *)palloc(tupleLength);
+      } else {
+        convert(data, bytes, values, nattrs);
+        HeapTuple heapTuple = BuildTupleFromCStrings(attinmeta, values); // result.data is a string type , but we need char **values)
+        MinimalTuple minTuple = minimal_tuple_from_heap_tuple(heapTuple);
+        ExecStoreMinimalTuple(minTuple, tupleTableSlot, true);
+        (*receiver->receiveSlot) (tupleTableSlot, receiver);
+      }
+    }
+
+    ExecClearTuple(tupleTableSlot);
+    (*receiver->rShutdown) (receiver);
+    MemoryContextSwitchTo(oldcontext);
+  }
+
+  /*
+   * Build command completion status string, if caller wants one.
+   */
+  if (completionTag)
+  {
+    Oid     lastOid;
+
+    switch (operation)
+    {
+      case CMD_SELECT:
+        snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
+             "SELECT %u", es_processed);
+        break;
+      case CMD_INSERT:
+        /*
+        if (queryDesc->estate->es_processed == 1)
+          lastOid = queryDesc->estate->es_lastoid;
+        else
+          lastOid = InvalidOid;
+          */
+        snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
+           "INSERT %u %u", 0, es_processed);
+        break;
+      case CMD_UPDATE:
+        snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
+             "UPDATE %u", es_processed);
+        break;
+      case CMD_DELETE:
+        snprintf(completionTag, COMPLETION_TAG_BUFSIZE,
+             "DELETE %u", es_processed);
+        break;
+      default:
+        strcpy(completionTag, "???");
+        break;
     }
   }
 
-  ExecClearTuple(tupleTableSlot);
-  (*receiver->rShutdown) (receiver);
-  MemoryContextSwitchTo(oldcontext);
+  /*
+   * If a command completion tag was supplied, use it.  Otherwise use the
+   * portal's commandTag as the default completion tag.
+   *
+   * Exception: Clients expect INSERT/UPDATE/DELETE tags to have counts, so
+   * fake them with zeros.  This can happen with DO INSTEAD rules if there
+   * is no replacement query of the same type as the original.  We print "0
+   * 0" here because technically there is no query of the matching tag type,
+   * and printing a non-zero count for a different query type seems wrong,
+   * e.g.  an INSERT that does an UPDATE instead should not print "0 1" if
+   * one row was updated.  See QueryRewrite(), step 3, for details.
+   */
+  if (completionTag && completionTag[0] == '\0')
+  {
+    if (portal->commandTag)
+      strcpy(completionTag, portal->commandTag);
+    if (strcmp(completionTag, "SELECT") == 0)
+      sprintf(completionTag, "SELECT 0 0");
+    else if (strcmp(completionTag, "INSERT") == 0)
+      strcpy(completionTag, "INSERT 0 0");
+    else if (strcmp(completionTag, "UPDATE") == 0)
+      strcpy(completionTag, "UPDATE 0");
+    else if (strcmp(completionTag, "DELETE") == 0)
+      strcpy(completionTag, "DELETE 0");
+  }
 }
 
 /*
@@ -970,6 +1057,8 @@ exec_remote_query(const char *query_string)
 {
 	CommandDest dest = whereToSendOutput;
 	MemoryContext oldcontext;
+  List     *parsetree_list;
+  ListCell   *parsetree_item;
 	bool		save_log_statement_stats = log_statement_stats;
 	bool		was_logged = false;
 	bool		isTopLevel;
@@ -1020,17 +1109,50 @@ exec_remote_query(const char *query_string)
 	 */
 	oldcontext = MemoryContextSwitchTo(MessageContext);
 
+  /*
+   * Do basic parsing of the query or queries (this should be safe even if
+   * we are in aborted transaction state!)
+   */
+  parsetree_list = pg_parse_query(query_string);
+
+  /* Log immediately if dictated by log_statement */
+  if (check_log_statement(parsetree_list))
+  {
+    ereport(LOG,
+        (errmsg("statement: %s", query_string),
+         errhidestmt(true),
+         errdetail_execute(parsetree_list)));
+    was_logged = true;
+  }
+
 	/*
 	 * Switch back to transaction context to enter the loop.
 	 */
 	MemoryContextSwitchTo(oldcontext);
 
+  foreach(parsetree_item, parsetree_list)
 	{
+    Node     *parsetree = (Node *) lfirst(parsetree_item);
 		bool		snapshot_set = false;
+    const char *commandTag;
 		char		completionTag[COMPLETION_TAG_BUFSIZE];
+    List     *querytree_list,
+             *plantree_list;
 		Portal		portal;
 		DestReceiver *receiver;
 		int16		format;
+
+    /*
+     * Get the command name for use in status display (it also becomes the
+     * default completion tag, down inside PortalRun).  Set ps_status and
+     * do any special start-of-SQL-command processing needed by the
+     * destination.
+     */
+    commandTag = CreateCommandTag(parsetree);
+
+    set_ps_display(commandTag, false);
+
+    BeginCommand(commandTag, dest);
 
 		/* Make sure we are in a transaction command */
 		start_xact_command();
@@ -1038,7 +1160,27 @@ exec_remote_query(const char *query_string)
 		/* If we got a cancel signal in parsing or prior command, quit */
 		CHECK_FOR_INTERRUPTS();
 
+    /*
+     * Set up a snapshot if parse analysis/planning will need one.
+     */
+    if (analyze_requires_snapshot(parsetree))
+    {
+      PushActiveSnapshot(GetTransactionSnapshot());
+      snapshot_set = true;
+    }
+
 		oldcontext = MemoryContextSwitchTo(MessageContext);
+
+
+    querytree_list = pg_analyze_and_rewrite(parsetree, query_string,
+                        NULL, 0);
+
+    plantree_list = pg_plan_queries(querytree_list, 0, NULL);
+
+
+    /* Done with the snapshot used for parsing/planning */
+    if (snapshot_set)
+      PopActiveSnapshot();
 
 		/*
 		 * Create unnamed portal to run the query or queries in. If there
@@ -1046,7 +1188,18 @@ exec_remote_query(const char *query_string)
 		 */
 		portal = CreatePortal("", true, true);
 		/* Don't display the portal in pg_cursors */
-		portal->visible = false;
+    portal->visible = false;
+    /*
+     * We don't have to copy anything into the portal, because everything
+     * we are passing here is in MessageContext, which will outlive the
+     * portal anyway.
+     */
+    PortalDefineQuery(portal,
+        NULL,
+        query_string,
+        commandTag,
+        plantree_list,
+        NULL);
 
 		/*
 		 * Select the appropriate output format: text unless we are doing a
@@ -1068,8 +1221,9 @@ exec_remote_query(const char *query_string)
 		 */
     MemoryContextSwitchTo(oldcontext);
 
-    get_dsql_result(receiver);
+    get_dsql_result(portal, receiver, completionTag);
     (*receiver->rDestroy) (receiver);
+    PortalDrop(portal, false);
 
 		/*
 		 * Tell client that we're done with this query.  Note we emit exactly
