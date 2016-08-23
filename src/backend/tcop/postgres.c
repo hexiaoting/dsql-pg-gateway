@@ -63,6 +63,7 @@
 #include "storage/proc.h"
 #include "storage/procsignal.h"
 #include "storage/sinval.h"
+#include "storage/pmsignal.h"
 #include "tcop/fastpath.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
@@ -104,10 +105,31 @@ int			PostAuthDelay = 0;
 
 /* flag set for dsqld*/
 bool    bird = true;
+bool    dsql_connected = false;
 
-MemoryContext dsql_context = NULL;
+//MemoryContext dsql_context = NULL;
 MemoryContext dsql_meta_context = NULL;
 
+typedef struct WorkerSyncData
+{
+  Oid     wi_dboid;
+  PGPROC     *wi_proc;
+  char    sub_query[1000]
+} WorkerSyncData;
+typedef struct WorkerSyncData *WorkerSyncInfo;
+
+typedef struct
+{
+  pid_t   sm_launcherpid;
+  WorkerSyncInfo  sm_startingWorker;
+} SyncMetaShmemStruct;
+static SyncMetaShmemStruct *SyncMetaShmem;
+
+struct Meta {
+  char dbname[NAMEDATALEN];
+  char sub_query[200];
+  struct Meta *next;
+};
 
 /* ----------------
  *		private variables
@@ -185,6 +207,7 @@ static int	UseNewLine = 0;		/* Use EOF as query delimiters */
 static bool RecoveryConflictPending = false;
 static bool RecoveryConflictRetryable = true;
 static ProcSignalReason RecoveryConflictReason;
+static bool am_syncmeta_worker = false;
 
 /* ----------------------------------------------------------------
  *		decls for routines only used in this file
@@ -886,6 +909,510 @@ pg_plan_queries(List *querytrees, int cursorOptions, ParamListInfo boundParams)
 	return stmt_list;
 }
 
+bool
+IsSyncMetaWorkerProcess()
+{
+  return am_syncmeta_worker;
+}
+
+/*
+ * SyncMetaShmemSize
+ *    Compute space needed for autovacuum-related shared memory
+ */
+Size
+SyncMetaShmemSize(void)
+{
+  Size    size;
+
+  size = sizeof(SyncMetaShmemStruct);
+  size = MAXALIGN(size);
+  size = add_size(size, sizeof(WorkerSyncData));
+  return size;
+}
+
+/*
+ * SyncMetaShmemInit
+ *    Allocate and initialize syncmeta-related shared memory
+ */
+void
+SyncMetaShmemInit(void)
+{
+  bool    found;
+
+  SyncMetaShmem = (SyncMetaShmemStruct *)
+    ShmemInitStruct("SyncMeta Data",
+            SyncMetaShmemSize(),
+            &found);
+
+  if (!IsUnderPostmaster)
+  {
+    Assert(!found);
+    SyncMetaShmem->sm_launcherpid = 0;
+    SyncMetaShmem->sm_startingWorker = NULL;
+  }
+  else
+    Assert(found);
+}
+
+static HTAB *DsqldNodesHash = NULL; /* worker node hash in shared memory */
+int MaxDsqldNodesTracked = 2048;    /* determines worker node hash table size */
+#define DSQLD_LENGTH 256
+
+typedef struct DsqldNode
+{
+  int dsqldPort;
+  char dsqldName[DSQLD_LENGTH];
+  char dsqldIp[DSQLD_LENGTH];
+  bool isValid;
+} DsqldNode;
+static uint32 DsqldNodeHashCode(const void *key, Size keySize);
+static DsqldNode *FindRandomNodeNotInList(HTAB *DsqldNodesHash, List *currentNodeList);
+static DsqldNode *getDsqldIp();
+void DsqldNodeShmemInit(void);
+static uint32 DsqldNodeHashCode(const void *key, Size keySize);
+static int DsqldNodeCompare(const void *lhsKey, const void *rhsKey, Size keySize);
+static bool ListMember(List *currentList, DsqldNode *workerNode);
+
+static uint32
+DsqldNodeHashCode(const void *key, Size keySize)
+{
+  const DsqldNode *node = (const DsqldNode *) key;
+  const char *dsqldName = node->dsqldName;
+  const uint32 *dsqldPort = &(node->dsqldPort);
+
+  /* standard hash function outlined in Effective Java, Item 8 */
+  uint32 result = 17;
+  result = 37 * result + string_hash(dsqldName, DSQLD_LENGTH);
+  result = 37 * result + tag_hash(dsqldPort, sizeof(uint32));
+  return result;
+}
+
+static int
+DsqldNodeCompare(const void *lhsKey, const void *rhsKey, Size keySize)
+{
+  const DsqldNode *nodeLhs = (const DsqldNode *) lhsKey;
+  const DsqldNode *nodeRhs = (const DsqldNode *) rhsKey;
+
+  int nameCompare = 0;
+  int portCompare = 0;
+
+  nameCompare = strncmp(nodeLhs->dsqldName, nodeRhs->dsqldName, DSQLD_LENGTH);
+  if (nameCompare != 0)
+  {
+    return nameCompare;
+  }
+
+  portCompare = nodeLhs->dsqldPort - nodeRhs->dsqldPort;
+  return portCompare;
+}
+
+/* Initializes the shared memory used for managing worker nodes. */
+void
+DsqldNodeShmemInit(void)
+{
+  HASHCTL info;
+  int hashFlags = 0;
+  long maxTableSize = 0;
+  long initTableSize = 0;
+
+  maxTableSize = (long) MaxDsqldNodesTracked;
+  initTableSize = maxTableSize / 8;
+
+  memset(&info, 0, sizeof(info));
+  info.keysize = DSQLD_LENGTH + sizeof(uint32);
+  info.entrysize = sizeof(DsqldNode);
+  info.hash = DsqldNodeHashCode;
+  info.match = DsqldNodeCompare;
+  hashFlags = (HASH_ELEM | HASH_FUNCTION | HASH_COMPARE);
+
+  DsqldNodesHash = ShmemInitHash("Dsqld Node Hash",
+      initTableSize, maxTableSize,
+      &info, hashFlags);
+}
+
+DsqldNode *getDsqldIp()
+{
+  return FindRandomNodeNotInList(DsqldNodesHash, NIL);
+}
+
+/*
+ * FindRandomNodeNotInList finds a random node from the shared hash that is not
+ * a member of the current node list. The caller is responsible for making the
+ * necessary node count checks to ensure that such a node exists.
+ *
+ * Note that this function has a selection bias towards nodes whose positions in
+ * the shared hash are sequentially adjacent to the positions of nodes that are
+ * in the current node list. This bias follows from our decision to first pick a
+ * random node in the hash, and if that node is a member of the current list, to
+ * simply iterate to the next node in the hash. Overall, this approach trades in
+ * some selection bias for simplicity in design and for bounded execution time.
+ */
+static DsqldNode *
+FindRandomNodeNotInList(HTAB *DsqldNodesHash, List *currentNodeList)
+{
+  DsqldNode *dsqldNode = NULL;
+  HASH_SEQ_STATUS status;
+  uint32 dsqldNodeCount = 0;
+  uint32 currentNodeCount PG_USED_FOR_ASSERTS_ONLY = 0;
+  bool lookForDsqldNode = true;
+  uint32 dsqldPosition = 0;
+  uint32 dsqldIndex = 0;
+
+  dsqldNodeCount = hash_get_num_entries(DsqldNodesHash);
+  currentNodeCount = list_length(currentNodeList);
+  Assert(dsqldNodeCount > currentNodeCount);
+
+  /*
+   * We determine a random position within the worker hash between [1, N],
+   * assuming that the number of elements in the hash is N. We then get to
+   * this random position by iterating over the worker hash. Please note that
+   * the random seed has already been set by the postmaster when starting up.
+   */
+  dsqldPosition = (random() % dsqldNodeCount) + 1;
+  hash_seq_init(&status, DsqldNodesHash);
+
+  for (dsqldIndex = 0; dsqldIndex < dsqldPosition; dsqldIndex++)
+  {
+    dsqldNode = (DsqldNode *) hash_seq_search(&status);
+  }
+
+  while (lookForDsqldNode)
+  {
+    bool listMember = ListMember(currentNodeList, dsqldNode);
+
+    if (dsqldNode->isValid && !listMember)
+    {
+      lookForDsqldNode = false;
+    }
+    else
+    {
+      /* iterate to the next worker node in the hash */
+      dsqldNode = (DsqldNode *) hash_seq_search(&status);
+
+      /* reached end of hash; start from the beginning */
+      if (dsqldNode == NULL)
+      {
+        hash_seq_init(&status, DsqldNodesHash);
+        dsqldNode = (DsqldNode *) hash_seq_search(&status);
+      }
+    }
+  }
+
+  /* we stopped scanning before completion; therefore clean up scan */
+  hash_seq_term(&status);
+
+  return dsqldNode;
+}
+
+/* Checks if given worker node is a member of the current list. */
+static bool
+ListMember(List *currentList, DsqldNode *workerNode)
+{
+  bool listMember = false;
+  Size keySize = DSQLD_LENGTH + sizeof(uint32);
+
+  ListCell *currentCell = NULL;
+  foreach(currentCell, currentList)
+  {
+    DsqldNode *currentNode = (DsqldNode *) lfirst(currentCell);
+    if (DsqldNodeCompare(workerNode, currentNode, keySize) == 0)
+    {
+      listMember = true;
+    }
+  }
+
+  return listMember;
+}
+
+void
+ResetDsqldNodesHash()
+{
+  DsqldNode *workerNode = NULL;
+
+  HASH_SEQ_STATUS status;
+  hash_seq_init(&status, DsqldNodesHash);
+
+  workerNode = (DsqldNode *) hash_seq_search(&status);
+  while (workerNode != NULL)
+  {
+    workerNode->isValid = false;
+    workerNode = (DsqldNode *) hash_seq_search(&status);
+  }
+}
+
+void
+AddDsqldMember(DsqldNode *parsedNode)
+{
+    DsqldNode *workerNode = NULL;
+    void *hashKey = NULL;
+    bool handleFound = false;
+    hashKey = (void *) parsedNode;
+    if (!parsedNode->isValid) {
+      workerNode = (DsqldNode *) hash_search(DsqldNodesHash, hashKey,
+          HASH_REMOVE, &handleFound);
+      return;
+    } else {
+      workerNode = (DsqldNode *) hash_search(DsqldNodesHash, hashKey,
+          HASH_ENTER, &handleFound);
+    }
+
+    if (handleFound)
+    {
+      /* display notification if worker node's rack changed */
+      char *oldDsqldIp = workerNode->dsqldIp;
+      char *newDsqldIp = parsedNode->dsqldIp;
+
+      if (strncmp(oldDsqldIp, newDsqldIp, DSQLD_LENGTH) != 0)
+      {
+        ereport(INFO, (errmsg("dsqld node: \"%s:%u\" changed ip",
+                    workerNode->dsqldName, workerNode->dsqldPort)));
+      }
+
+    }
+
+    strlcpy(workerNode->dsqldName, parsedNode->dsqldName, DSQLD_LENGTH);
+    strlcpy(workerNode->dsqldIp, parsedNode->dsqldIp, DSQLD_LENGTH);
+    workerNode->dsqldPort = parsedNode->dsqldPort;
+    workerNode->isValid = parsedNode->isValid;
+}
+
+bool table_or_index_exist(const char *query_string);
+bool dup_create(char *query)
+{
+  char name[60] = "\0";
+  char tmp_query[80] = "drop ";
+  int i = 6, j = 0, type = 0, size = strlen(query);
+  if (strncmp(query, "create", 6))
+    return false;
+  while(query[i] == ' ' && i < size)
+    i++;
+  switch(query[i]) {
+    case 'i':
+    case 'I':
+      strcat(tmp_query, "index ");
+      type = 1;
+      i += 5;
+      break;
+    case 't':
+    case 'T':
+      strcat(tmp_query, "table ");
+      type = 2;
+      i += 5;
+      break;
+    case 'f':
+    case 'F':
+      strcat(tmp_query, "function ");
+      type = 3;
+      i += 8;
+      break;
+    default:
+      return false;
+  }
+
+  while(query[i] == ' ' && i < size)
+    i++;
+  while(query[i] != ' ' && query[i] != '(') {
+    name[j++] = query[i++];
+  }
+  name[j] = '\0';
+  strcat(tmp_query, name);
+
+  if (table_or_index_exist(query)) {
+    exec_dsql_simple_query(tmp_query);
+  }
+  /*
+  if ((type == 1 && index_exist(name)) || (type == 2 && table_or_index_exist(name)) || (type == 3 && function_exist(name))) {
+    elog(LOG, "hwt exec_dsql_simple_query %s", tmp_query);
+    exec_dsql_simple_query(tmp_query);
+  }
+  */
+}
+
+void do_sync(char * query)
+{
+  elog(LOG, "pid=%d hwt do_sync query=%s, dsql_meta_context=%s", getpid(), query, dsql_meta_context);
+  dsql_meta_context = AllocSetContextCreate(TopMemoryContext,
+                      "syncmeta worker",
+                      ALLOCSET_DEFAULT_MINSIZE,
+                      ALLOCSET_DEFAULT_INITSIZE,
+                      ALLOCSET_DEFAULT_MAXSIZE);
+  if (query == NULL)
+    return ;
+  // If create table/index/function, and already exist,
+  // then : drop old one
+  //        create new one
+  // Because the new one may be differ from the old one.
+  dup_create(query);
+  exec_dsql_simple_query(query);
+}
+
+static void
+sigterm(SIGNAL_ARGS)
+{
+  SetLatch(MyLatch);
+
+  exit(1);
+}
+
+void SyncDBWorkerMain(int argc, char *argv[])
+{
+  sigjmp_buf  local_sigjmp_buf;
+  Oid     dbid;
+  char *query = NULL;
+  am_syncmeta_worker = true;
+
+  /* Identify myself via ps */
+  init_ps_display("sync db", "", "", "");
+
+  SetProcessingMode(InitProcessing);
+
+  /*
+   * Set up signal handlers.  We operate on databases much like a regular
+   * backend, so we use the same signal handling.  See equivalent code in
+   * tcop/postgres.c.
+   */
+	pqsignal(SIGHUP, SigHupHandler);
+
+  /*
+   * SIGINT is used to signal canceling the current table's vacuum; SIGTERM
+   * means abort and exit cleanly, and SIGQUIT means abandon ship.
+   */
+  pqsignal(SIGINT, StatementCancelHandler);
+  pqsignal(SIGTERM, sigterm);
+  pqsignal(SIGQUIT, quickdie);
+  InitializeTimeouts();   /* establishes SIGALRM handler */
+
+  pqsignal(SIGPIPE, SIG_IGN);
+  pqsignal(SIGUSR1, procsignal_sigusr1_handler);
+  pqsignal(SIGUSR2, SIG_IGN);
+  pqsignal(SIGFPE, FloatExceptionHandler);
+  pqsignal(SIGCHLD, SIG_DFL);
+
+  /* Early initialization */
+  BaseInit();
+
+  /*
+   * Create a per-backend PGPROC struct in shared memory, except in the
+   * EXEC_BACKEND case where this was done in SubPostmasterMain. We must do
+   * this before we can use LWLocks (and in the EXEC_BACKEND case we already
+   * had to do some stuff with LWLocks).
+   */
+#ifndef EXEC_BACKEND
+  InitProcess();
+#endif
+
+  /*
+   * If an exception is encountered, processing resumes here.
+   *
+   * See notes in postgres.c about the design of this coding.
+   */
+  if (sigsetjmp(local_sigjmp_buf, 1) != 0)
+  {
+    /* Prevents interrupts while cleaning up */
+    HOLD_INTERRUPTS();
+
+    /* Report the error to the server log */
+    EmitErrorReport();
+
+    /*
+     * We can now go away.  Note that because we called InitProcess, a
+     * callback was registered to do ProcKill, which will clean up
+     * necessary state.
+     */
+    proc_exit(0);
+  }
+
+  /*
+   * beware of startingWorker being INVALID; this should normally not
+   * happen, but if a worker fails after forking and before this, the
+   * launcher might have decided to remove it from the queue and start
+   * again.
+   */
+  //TODO lock
+      LWLockAcquire(SyncMetaLock, LW_EXCLUSIVE);
+  //LWLockAcquire(SyncMetaLock, LW_SHARED);
+  if (SyncMetaShmem->sm_startingWorker != NULL)
+  {
+    WorkerSyncInfo worker;
+    worker = SyncMetaShmem->sm_startingWorker;
+    dbid = worker->wi_dboid;
+    query = strdup(worker->sub_query);
+    worker->wi_proc = MyProc;
+    SyncMetaShmem->sm_startingWorker = NULL;
+    elog(LOG, "hwt --->%s:%d in_dbname=%d, query=%s", __func__, __LINE__, dbid, query);
+    /* wake up the launcher */
+    if (SyncMetaShmem->sm_launcherpid != 0)
+      kill(SyncMetaShmem->sm_launcherpid, SIGUSR2);
+  }
+  else
+  {
+    /* no worker entry for me, go away */
+    elog(WARNING, "autovacuum worker started without a worker entry");
+    dbid = InvalidOid;
+  }
+  LWLockRelease(SyncMetaLock);  /* either shared or exclusive */
+
+  if (OidIsValid(dbid))
+  {
+    char    dbname[NAMEDATALEN];
+
+    /*
+     * Connect to the selected database
+     *
+     * Note: if we have selected a just-deleted database (due to using
+     * stale stats info), we'll fail and exit here.
+     */
+    elog(LOG, "pid=%d  hwt --->%s:%d in_dbname=%d, query=%s", getpid(), __func__, __LINE__, dbid, query);
+    InitPostgres(NULL, dbid, NULL, InvalidOid, dbname);
+    SetProcessingMode(NormalProcessing);
+    set_ps_display(dbname, false);
+    ereport(INFO,
+        (errmsg("autovacuum: processing database \"%s\"", dbname)));
+
+    do_sync(query);
+  }
+
+  /*
+   * The launcher will be notified of my death in ProcKill, *if* we managed
+   * to get a worker slot at all
+   */
+
+  /* All done, go away */
+  proc_exit(0);
+}
+
+int
+StartSyncDBWorker(void)
+{
+  pid_t   worker_pid;
+
+  switch ((worker_pid = fork_process()))
+  {
+    case -1:
+      ereport(LOG,
+          (errmsg("could not fork autovacuum worker process: %m")));
+      return 0;
+
+#ifndef EXEC_BACKEND
+    case 0:
+      /* in postmaster child ... */
+      InitPostmasterChild();
+
+      /* Close the postmaster's sockets */
+      ClosePostmasterPorts(false);
+
+      SyncDBWorkerMain(0, NULL);
+      break;
+#endif
+    default:
+      elog(LOG, "masterpid=%d hwt ---->StartSyncDBWorker pid=%d", getpid(), worker_pid);
+      return (int) worker_pid;
+  }
+
+  /* shouldn't get here */
+  return 0;
+}
+
 int convert_type(char *type) {
   if (strncmp(type, "varchar", 7) == 0)
     return VARCHAROID;
@@ -944,18 +1471,20 @@ void get_dsql_result(Portal portal, DestReceiver *receiver, char *completionTag)
     }
   }
   if (operation == CMD_INSERT) {
-    es_processed = get_insert_rows();
-  } else {
+    es_processed = get_inserted_rows();
+  } else if (operation == CMD_DELETE || operation == CMD_UPDATE){
+    es_processed = get_deletedUpdated_rows();
+  } else if (operation == CMD_SELECT){
     // process dsql result
-    int nattrs = get_cols_num();
+    int nattrs = get_col_num();
     TupleDesc tupleDesc = CreateTemplateTupleDesc(nattrs, false);
-    int bytes = 0, tupleLength = 1024;;
-    MemoryContext oldcontext = MemoryContextSwitchTo(dsql_context);
-    char *colName = MemoryContextAllocZero(dsql_context, nattrs * 32);
-    char *colType = MemoryContextAllocZero(dsql_context, nattrs * 20);
-    char **values = MemoryContextAllocZero(dsql_context, nattrs * sizeof(char *));
+    int bytes = 0, tupleLength = 1024;
+    MemoryContext oldcontext = MemoryContextSwitchTo(MessageContext);
+    char *colName = MemoryContextAllocZero(MessageContext, nattrs * 32);
+    char *colType = MemoryContextAllocZero(MessageContext, nattrs * 20);
+    char **values = MemoryContextAllocZero(MessageContext, nattrs * sizeof(char *));
     char *data = (char *)palloc(tupleLength);
-    if(!get_column_name(colName) || !get_type_name(colType))
+    if(!get_col_name(colName) || !get_type_name(colType))
       ereport(ERROR,
           (errcode(ERRCODE_UNDEFINED_DATABASE),
            errmsg("the size of column name or type is exceed.")));
@@ -1015,7 +1544,7 @@ void get_dsql_result(Portal portal, DestReceiver *receiver, char *completionTag)
              "DELETE %u", es_processed);
         break;
       default:
-        strcpy(completionTag, "???");
+        strcpy(completionTag, portal->commandTag);
         break;
     }
   }
@@ -1047,6 +1576,26 @@ void get_dsql_result(Portal portal, DestReceiver *receiver, char *completionTag)
   }
 }
 
+bool substr(char *query, char *tmp){
+  int i = 0, len = strlen(query), size = strlen(tmp);
+  if (query == NULL || tmp == NULL)
+    return false;
+  for (i = 0; i <= len - size; i++) {
+    if (strncmp(&query[i], tmp, size) == 0)
+      return true;
+  }
+  return false;
+}
+
+bool is_pg_query(char *query_string) {
+  if (substr(query_string, "pg_") || substr(query_string, "extension") || substr(query_string, "function")
+      || substr(query_string, "launch") || substr(query_string, "::") || substr(query_string, "DateStyle"))
+    return true;
+  if ((substr(query_string, "SET") ||substr(query_string, "set")) && !substr(query_string, "dsql"))
+    return true;
+  return false;
+}
+
 /*
  * exec_remote_query
  *
@@ -1063,6 +1612,8 @@ exec_remote_query(const char *query_string)
 	bool		was_logged = false;
 	bool		isTopLevel;
 	char		msec_str[32];
+  char *status, *set_query;
+  int i;
 
 	/*
 	 * Report query to various monitoring facilities.
@@ -1073,11 +1624,26 @@ exec_remote_query(const char *query_string)
 
 	TRACE_POSTGRESQL_QUERY_START(query_string);
 
-  char *status = request_remote(query_string);
+  if (substr(query_string, "dsql.") && substr(query_string, "set")) {
+    set_query = strdup(query_string);
+    for (i = 0; i < strlen(query_string); i++) {
+      if (strncmp(&set_query[i], "dsql.", 5) == 0) {
+        set_query[i] = ' ';
+        set_query[i + 1] = ' ';
+        set_query[i + 2] = ' ';
+        set_query[i + 3] = ' ';
+        set_query[i + 4] = ' ';
+        status = request_remote(set_query);
+        break;
+      }
+    }
+  } else {
+    status = request_remote(query_string);
+  }
   if (status != NULL) {
     ereport(ERROR,
       (errcode(ERRCODE_UNDEFINED_DATABASE),
-       errmsg("request_remote failed.")));
+       errmsg("request_remote failed. %s %s", query_string, status)));
   }
 
 	/*
@@ -1247,49 +1813,132 @@ exec_remote_query(const char *query_string)
 	debug_query_string = NULL;
 }
 
-bool database_exist(const char *dbname)
+Oid get_db_oid(const char *dbname)
 {
-  Relation  pg_database;
+  Relation  pg_database = NULL;
   ScanKeyData entry[1];
   SysScanDesc scan;
-  HeapTuple dbtuple;
-  Oid     oid;
+  HeapTuple dbtuple = NULL;
+  Oid     oid = InvalidOid;
 
-	start_xact_command();
+  StartTransactionCommand();
+  (void) GetTransactionSnapshot();
+
   pg_database = heap_open(DatabaseRelationId, AccessShareLock);
-  ScanKeyInit(&entry[0],
-      Anum_pg_database_datname,
-      BTEqualStrategyNumber, F_NAMEEQ,
-      CStringGetDatum(dbname));
-  scan = systable_beginscan(pg_database, DatabaseNameIndexId, true,
-      NULL, 1, entry);
+  scan = heap_beginscan_catalog(pg_database, 0, NULL);
 
-  dbtuple = systable_getnext(scan);
+  while (HeapTupleIsValid(dbtuple = heap_getnext(scan, ForwardScanDirection)))
+  {
+    Form_pg_database pgdatabase = (Form_pg_database) GETSTRUCT(dbtuple);
+    if (strcmp(NameStr(pgdatabase->datname), dbname) == 0)
+      oid = HeapTupleGetOid(dbtuple);
+  }
 
-  /* We assume that there can be at most one matching tuple */
-  if (HeapTupleIsValid(dbtuple))
-    oid = HeapTupleGetOid(dbtuple);
-  else
-    oid = InvalidOid;
-
-  systable_endscan(scan);
+  heap_endscan(scan);
   heap_close(pg_database, AccessShareLock);
+  CommitTransactionCommand();
+  return oid;
+}
 
-	finish_xact_command();
+bool database_exist(const char *dbname)
+{
+  Oid oid = get_db_oid(dbname);
   if (!OidIsValid(oid))
     return false;
   return true;
 }
 
-void exec_dsql_query(const char *query_string, const char *db_name)
+bool table_or_index_exist(const char *query_string)
 {
+  List     *parsetree_list,
+           *querytree_list,
+           *plantree_list,
+           *stmts;
+  Node     *parsetree,
+           *stmt;
+  Oid      namespaceId,
+           existing_relid;
+
+  start_xact_command();
+  parsetree_list = pg_parse_query(query_string);
+  Assert(list_length(parsetree_list) == 1);
+  parsetree = (Node *) lfirst(list_head(parsetree_list));
+  querytree_list = pg_analyze_and_rewrite(parsetree, query_string,
+      NULL, 0);
+  plantree_list = pg_plan_queries(querytree_list, 0, NULL);
+
+  Assert(list_length(plantree_list) == 1);
+  if (nodeTag(parsetree) != T_CreateStmt)
+    return false;
+
+  /* Run parse analysis ... */
+  stmts = transformCreateStmt((CreateStmt *) parsetree, NULL);
+  Assert(list_length(stmts) == 1);
+  stmt = (Node *) lfirst(list_head(stmts));
+  namespaceId = RangeVarGetAndCheckCreationNamespace(((CreateStmt *)stmt)->relation, NoLock, NULL);
+  existing_relid = get_relname_relid(((CreateStmt *)stmt)->relation->relname, namespaceId);
+  finish_xact_command();
+
+  return  (existing_relid != InvalidOid);
+}
+
+void create_context() {
+  SyncMetaShmem->sm_launcherpid = MyProcPid;
+  elog(LOG, " PostgresMain dsql_meta_context=%s", dsql_meta_context);
   dsql_meta_context = AllocSetContextCreate(TopMemoryContext,
       "DsqlMessageContext",
       ALLOCSET_DEFAULT_MINSIZE,
       ALLOCSET_DEFAULT_INITSIZE,
       ALLOCSET_DEFAULT_MAXSIZE);
-  if (database_exist(db_name) && strncmp(query_string, "create", 6) == 0) {
-    elog(LOG, "hwt db exist:%s, return ", query_string);
+}
+
+void sync_meta_to_pg(struct Meta* head)
+{
+  struct Meta *cur = head;
+  struct Meta *tmp = NULL;
+  Oid dboid;
+	MemoryContext oldcontext;
+
+  while(cur != NULL) {
+    dboid = get_db_oid(cur->dbname);
+    if(dboid != InvalidOid) {
+      while (SyncMetaShmem->sm_startingWorker) {
+        pg_usleep(1000000L);
+      }
+      LWLockAcquire(SyncMetaLock, LW_EXCLUSIVE);
+      WorkerSyncInfo  worker;
+      worker = (WorkerSyncInfo) ((char *) SyncMetaShmem +
+          MAXALIGN(sizeof(SyncMetaShmemStruct)));
+      // launch a new meta sync bgworker for this database
+      worker->wi_dboid = dboid;
+      worker->wi_proc = NULL;
+      strcpy(worker->sub_query, cur->sub_query);
+
+      SyncMetaShmem->sm_startingWorker = worker;
+      elog(LOG, "pid=%d hwt %s:%d, worker->sub_query=%s, dboid=%d dbname=%s, send signal",
+          getpid(), __func__, __LINE__, worker->sub_query, dboid, cur->dbname);
+      SendPostmasterSignal(PMSIGNAL_START_SYNCMETA_WORKER);
+      pg_usleep(1000000L);
+      //TODO lock
+      LWLockRelease(SyncMetaLock);
+    } else {
+      elog(LOG, "hwt dboid is InvalidOid %s", cur->dbname);
+    }
+    tmp = cur->next;
+    cur = tmp;
+  }
+}
+
+/*
+ * option:
+ *  1. create database
+ *  11. drop database
+ */
+void exec_dsql_query(const char *query_string, const char *db_name, int option)
+{
+  if (((option == 1) && database_exist(db_name)) ||
+      (option == 11 && !database_exist(db_name))) {
+    elog(LOG, "pid=%d hwt db(re%s) :%s, return ", getpid(), (option == 1 ? "create" : "drop"), query_string);
     return ;
   }
   exec_dsql_simple_query(query_string);
@@ -1308,6 +1957,7 @@ exec_dsql_simple_query(const char *query_string)
 	char		msec_str[32];
 
 
+  elog(LOG, "hwt %s:%d query_string=%s", __func__, __LINE__, query_string);
 	/*
 	 * Report query to various monitoring facilities.
 	 */
@@ -2322,6 +2972,15 @@ exec_bind_message(StringInfo input_message)
 	/* Copy the plan's query string into the portal */
 	query_string = pstrdup(psrc->query_string);
 
+  if (!is_pg_query(query_string)) {
+    char *status = request_remote(query_string);
+    if (status != NULL) {
+      ereport(LOG,
+          (errcode(ERRCODE_UNDEFINED_DATABASE),
+           errmsg("request_remote failed: \"%s\"", query_string)));
+    }
+  }
+
 	/* Likewise make a copy of the statement name, unless it's unnamed */
 	if (stmt_name[0])
 		saved_stmt_name = pstrdup(stmt_name);
@@ -2715,12 +3374,17 @@ exec_execute_message(const char *portal_name, long max_rows)
 	if (max_rows <= 0)
 		max_rows = FETCH_ALL;
 
-	completed = PortalRun(portal,
+  if (!is_pg_query(portal->sourceText)) {
+    get_dsql_result(portal, receiver, completionTag);
+    completed = true;
+  } else {
+    completed = PortalRun(portal,
 						  max_rows,
-						  true, /* always top level */
+						  true,
 						  receiver,
 						  receiver,
 						  completionTag);
+  }
 
 	(*receiver->rDestroy) (receiver);
 
@@ -3391,6 +4055,8 @@ die(SIGNAL_ARGS)
 		ProcessInterrupts();
 
 	errno = save_errno;
+  if (dsql_connected)
+    disconnect_dsqld();
 }
 
 /*
@@ -4271,23 +4937,17 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
 #endif
 }
 
-bool substr(char *query, char *tmp){
-  int i = 0, len = strlen(query), size = strlen(tmp);
-  if (query == NULL || tmp == NULL)
-    return false;
-  for (i = 0; i <= len - size; i++) {
-    if (strncmp(&query[i], tmp, size) == 0)
-      return true;
-  }
-  return false;
-}
-
 void connect_usedb(char *dbname) {
   int port = atoi((char *)GetConfigOption("dsqld_port", false, false));
-  connect_dsqld(port);
+  dsql_connected = true;
+  DsqldNode *node = getDsqldIp();
+  connect_dsqld((node == NULL ? "localhost" : node->dsqldIp), port);
   if (dbname != NULL) {
     char usedb[30] = "use ";
-    strcat(usedb, dbname);
+    if (strcmp(dbname, "postgres") == 0 || strncmp(dbname, "template", 8) == 0)
+      strcat(usedb, "dsql");
+    else
+      strcat(usedb, dbname);
     char *status = request_remote(usedb);
     if (status != NULL) {
       ereport(ERROR,
@@ -4319,17 +4979,20 @@ PostgresMain(int argc, char *argv[],
 	volatile bool send_ready_for_query = true;
   bool     first = true;
 
+  elog(LOG, "hwt PostgresMain");
 	/* Initialize startup process environment if necessary. */
 	if (!IsUnderPostmaster)
 		InitStandaloneProcess(argv[0]);
 
 	SetProcessingMode(InitProcessing);
 
+  /*
   dsql_context = AllocSetContextCreate(TopMemoryContext,
-      "DsqlMessageContext",
+      "DsqlPsqlMessageContext",
       ALLOCSET_DEFAULT_MINSIZE,
       ALLOCSET_DEFAULT_INITSIZE,
       ALLOCSET_DEFAULT_MAXSIZE);
+      */
 
   DefineCustomBoolVariable("amos",
                "test option",
@@ -4551,6 +5214,10 @@ PostgresMain(int argc, char *argv[],
 										   ALLOCSET_DEFAULT_MINSIZE,
 										   ALLOCSET_DEFAULT_INITSIZE,
 										   ALLOCSET_DEFAULT_MAXSIZE);
+  if (first) {
+    first = false;
+    connect_usedb(dbname);
+  }
 
 	/*
 	 * Remember stand-alone backend startup time
@@ -4801,29 +5468,12 @@ PostgresMain(int argc, char *argv[],
 						exec_replication_command(query_string);
           else {
             bird = true;
-            if (strncmp(dbname, "template", 8) == 0)
+            if (strncmp(dbname, "template", 8) == 0 || is_pg_query(query_string))
               bird = false;
-            if (substr(query_string, "!@#") || substr(query_string, "pg_") || substr(query_string, "extension") || substr(query_string, "function")
-                || substr(query_string, "launch") || substr(query_string, "::") || substr(query_string, "DateStyle")) {
-              bird = false;
-            }
             if (bird) {
-              if (first) {
-                first = false;
-                connect_usedb(dbname);
-              }
               exec_remote_query(query_string);
             } else {
-              if (strncmp(query_string, "!@#", 3) == 0) {
-                char *new_query = strdup(query_string);
-                new_query[0] = ' ';
-                new_query[1] = ' ';
-                new_query[2] = ' ';
-                elog(WARNING, "PostgreMain query =%s(db=%s)", new_query, dbname);
-                exec_simple_query(new_query);
-              } else {
-                exec_simple_query(query_string);
-              }
+              exec_simple_query(query_string);
             }
           }
 
@@ -5067,6 +5717,7 @@ PostgresMain(int argc, char *argv[],
 								firstchar)));
 		}
 	}							/* end of input-reading loop */
+  //MemoryContextDelete(dsql_context);
 }
 
 /*

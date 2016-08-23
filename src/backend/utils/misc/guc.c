@@ -435,10 +435,10 @@ char	   *application_name;
 int			tcp_keepalives_idle;
 int			tcp_keepalives_interval;
 int			tcp_keepalives_count;
-int     dsqld_port;
-int     statestored_port;
-int     heartbeat_port;
-char    *statestored_host;
+int			dsqld_port;
+int			statestored_port;
+int			heartbeat_port;
+int			*statestored_host;
 
 /*
  * SSL renegotiation was been removed in PostgreSQL 9.5, but we tolerate it

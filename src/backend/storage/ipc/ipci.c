@@ -243,6 +243,8 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 	ReplicationOriginShmemInit();
 	WalSndShmemInit();
 	WalRcvShmemInit();
+  SyncMetaShmemInit();
+  DsqldNodeShmemInit();
 
 	/*
 	 * Set up other modules that need some shared memory space

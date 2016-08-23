@@ -54,6 +54,7 @@ void		worker_spi_main(Datum) pg_attribute_noreturn();
 /* flags set by signal handlers */
 static volatile sig_atomic_t got_sighup = false;
 static volatile sig_atomic_t got_sigterm = false;
+static volatile sig_atomic_t got_SIGUSR2 = false;
 
 /* GUC variables */
 static int	worker_spi_naptime = 10;
@@ -73,6 +74,18 @@ worker_spi_sigterm(SIGNAL_ARGS)
 
 	errno = save_errno;
   exit(1);
+}
+
+/* SIGUSR2: a worker is up and running, or just finished, or failed to fork */
+static void
+avl_sigusr2_handler(SIGNAL_ARGS)
+{
+  int     save_errno = errno;
+
+  got_SIGUSR2 = true;
+  SetLatch(MyLatch);
+
+  errno = save_errno;
 }
 
 /*
@@ -95,42 +108,7 @@ worker_spi_sighup(SIGNAL_ARGS)
  * Initialize workspace for a worker process: create the schema if it doesn't
  * already exist.
  */
-static void
-initialize_worker_spi()
-{
-	int			ret;
-	int			ntup;
-	bool		isnull;
-	StringInfoData buf;
 
-	SetCurrentStatementStartTimestamp();
-	StartTransactionCommand();
-	SPI_connect();
-	PushActiveSnapshot(GetTransactionSnapshot());
-	pgstat_report_activity(STATE_RUNNING, "initializing spi_worker schema");
-
-	/* XXX could we use CREATE SCHEMA IF NOT EXISTS? */
-	initStringInfo(&buf);
-	appendStringInfo(&buf, "select count(*) from pg_namespace ");
-
-	ret = SPI_execute(buf.data, true, 0);
-	if (ret != SPI_OK_SELECT)
-		elog(FATAL, "SPI_execute failed: error code %d", ret);
-
-	if (SPI_processed != 1)
-		elog(FATAL, "not a singleton result");
-
-	ntup = DatumGetInt64(SPI_getbinval(SPI_tuptable->vals[0],
-									   SPI_tuptable->tupdesc,
-									   1, &isnull));
-	if (isnull)
-		elog(FATAL, "null result");
-
-	SPI_finish();
-	PopActiveSnapshot();
-	CommitTransactionCommand();
-	pgstat_report_activity(STATE_IDLE, NULL);
-}
 
 void
 worker_spi_main(Datum main_arg)
@@ -140,14 +118,13 @@ worker_spi_main(Datum main_arg)
 	/* Establish signal handlers before unblocking signals. */
 	pqsignal(SIGHUP, worker_spi_sighup);
 	pqsignal(SIGTERM, worker_spi_sigterm);
+  pqsignal(SIGUSR2, avl_sigusr2_handler);
 
 	/* We're now ready to receive signals */
 	BackgroundWorkerUnblockSignals();
 
 	/* Connect to our database */
-	BackgroundWorkerInitializeConnection("postgres", NULL);
-
-	initialize_worker_spi();
+	BackgroundWorkerInitializeConnection("template1", NULL);
 
 	initStringInfo(&buf);
 

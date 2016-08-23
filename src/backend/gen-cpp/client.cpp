@@ -3,20 +3,23 @@
 #include <string>
 #include <vector>
 #include <stdlib.h>
-
 #include <thrift/protocol/TBinaryProtocol.h>
 #include <thrift/transport/TSocket.h>
 #include <thrift/transport/TTransportUtils.h>
-
 #include "BeeswaxService.h"
 #include "beeswax_types.h"
 #include "ImpalaService.h"
 #include "ImpalaService_types.h"
 
+#define DSQLD_LENGTH 256 // dsql hostname and ip max length
+#define NAMEDATALEN 64   // The max size for tableName/colName/functionName
+                         // defined in pg_config_manual.h
+#define COLTYPELEN  20   // The max size for column type
+#define FETCHCOUNT 10000
+
 using namespace apache::thrift;
 using namespace apache::thrift::protocol;
 using namespace apache::thrift::transport;
-
 using namespace std;
 using namespace boost;
 using namespace beeswax;
@@ -30,6 +33,7 @@ protected:
 
 public:
   DsqlClient(char *ip, int port) {
+    // Connect to dsqld host
     try {
       boost::shared_ptr<TTransport> socket(new TSocket(ip, port));
       transport = (boost::shared_ptr<TTransport>)new TBufferedTransport(socket);
@@ -38,10 +42,12 @@ public:
       transport->open();
     } catch (...)
     {
-
     }
   }
 
+  // results:
+  //  0   finished
+  //  -1  exception
   int wait_to_finish()
   {
     while (true)
@@ -49,37 +55,34 @@ public:
       QueryState::type state = client->get_state(qhandle);
       if (state == (QueryState::FINISHED))
         return 0;
-      else if (state == (QueryState::EXCEPTION))
-      {
-        return 1;
+      else if (state == (QueryState::EXCEPTION)) {
+        return -1;
       }
     }
   }
+
   Results fetch_result()
   {
-    int fetch_size = 10000;
-    Results result ;
-    bool first = true;
-    // last parameter stands for Resultset_format is Binary
-    while (true)
-    {
-      Results tmp;
-      client->fetch(tmp, qhandle, false, fetch_size);
-      if (first)
-      {
-        first = false;
-        result = tmp;
-      }
-      else
-      {
+    Results   result;
+    client->fetch(result, qhandle, false, FETCHCOUNT);
+    if (result.has_more) {
+      // last parameter stands for Resultset_format is Binary
+      while (true) {
+        Results tmp;
+        client->fetch(tmp, qhandle, false, FETCHCOUNT);
         for (int i = 0; i < tmp.data.size(); i++)
           result.data.push_back(tmp.data[i]);
-      }
-      if (tmp.has_more == false)
-      {
-        return result;
+        if (!(tmp.has_more)) {
+          return result;
+        }
       }
     }
+  }
+
+  char *get_warning_log() {
+    string result;
+    client->get_log(result, qhandle.log_context);
+    return (char *)(result.c_str());
   }
 
   char *send_query(char* query_string) {
@@ -88,13 +91,13 @@ public:
       q.__set_query(query_string);
       q.__set_hadoop_user("root");
       client->query(qhandle, q);
-      wait_to_finish();
+      if(wait_to_finish() == -1)
+        return get_warning_log();
       return NULL;
     }  catch (const TException& e) {
       cerr <<  e.what();
       return (char *)(e.what());
     }
-
   }
 
   void get_results_metadata(ResultsMetadata& meta) {
@@ -118,50 +121,27 @@ public:
 };
 
 extern "C" {
-struct UpdateDsqldMember {
-  char hostname[20];
-  char ip_address[20];
-  int port;
-  struct UpdateDsqldMember *next;
-};
+typedef struct DsqldNode
+{
+  int  dsqldPort;
+  char dsqldName[DSQLD_LENGTH];
+  char dsqldIp[DSQLD_LENGTH];
+  bool isValid;
+} DsqldNode;
 
-DsqlClient *client;
+DsqlClient      *client;
 ResultsMetadata meta;
-Results res;
-int nattrs = -1;
-int rowCount = -1;
-int idx = 0;
-static struct UpdateDsqldMember *dsqlds = NULL;
+Results         res;
+int             nattrs = -1;   // column num
+int             rowCount = -1; // select result: row num
+int             idx = 0;
 
-void reset_dsqld_members(struct UpdateDsqldMember *head)
-{
-  struct UpdateDsqldMember *tmp = NULL;
-  struct UpdateDsqldMember *cur= dsqlds;
-  while (cur != NULL) {
-    tmp = cur->next;
-    free(cur);
-    cur = tmp;
-  }
-  dsqlds = head;
-}
-
-char *getRandomDsqlIp()
-{
-  if (dsqlds != NULL)
-    return dsqlds->ip_address;
-  return "localhost";
-}
-
-void connect_dsqld(int port)
-{
-  char *ip = getRandomDsqlIp();
-  client = new DsqlClient(ip, port);
-}
 char *request_remote(char *request)
 {
-  idx = 0;
-  nattrs = -1;
-  rowCount = -1;
+  idx       =   0;
+  nattrs    =   -1;
+  rowCount  =   -1;
+  //TODO: add exception
   return client->send_query(request);
 }
 
@@ -176,7 +156,7 @@ void get_meta_info()
   }
 }
 
-int get_cols_num()
+int get_col_num()
 {
   if (nattrs == -1){
     get_meta_info();
@@ -184,16 +164,14 @@ int get_cols_num()
   return nattrs;
 }
 
-
-bool get_column_name(char *colName) {
+bool get_col_name(char *colName) {
   if (nattrs == -1) {
     get_meta_info();
   }
-  //TODO : the size of col_name < 32
   for (int i = 0; i < nattrs; i++) {
-    if (strlen((char *)(meta.schema.fieldSchemas.at(i).name.c_str())) > 31)
+    if (strlen((char *)(meta.schema.fieldSchemas.at(i).name.c_str())) > (NAMEDATALEN - 1))
       return false;
-    strcpy(&colName[i * 32], (char *)(meta.schema.fieldSchemas.at(i).name.c_str()));
+    strcpy(&colName[i * NAMEDATALEN], (char *)(meta.schema.fieldSchemas.at(i).name.c_str()));
   }
   return true;
 }
@@ -201,26 +179,12 @@ bool get_column_name(char *colName) {
 bool get_type_name(char *colType) {
   res = client->fetch_result();
   for (int i = 0; i < res.columns.size(); i++) {
-    if (strlen((char *)(res.columns.at(i).c_str())) > 19)
+    if (strlen((char *)(res.columns.at(i).c_str())) > (COLTYPELEN - 1))
       return false;
-    strcpy(&colType[i * 20], (char *)(res.columns.at(i).c_str()));
+    strcpy(&colType[i * COLTYPELEN], (char *)(res.columns.at(i).c_str()));
   }
   rowCount = res.data.size();
   return true;
-}
-
-char **get_cols_name(int *num)
-{
-  client->get_results_metadata(meta);
-  ::Apache::Hadoop::Hive::Schema& schema = meta.schema;
-  *num = schema.fieldSchemas.size();
-  char **cols = (char **)malloc(sizeof(char *) * (*num));
-  if (cols == NULL)
-    return NULL;
-  for (int i = 0; i < *num; i++) {
-    cols[i] = (char *)(schema.fieldSchemas.at(i).name.c_str());
-  }
-  return cols;
 }
 
 int get_line(int length, char *data) {
@@ -240,11 +204,6 @@ int get_line(int length, char *data) {
   return line.size() + 1;
 }
 
-void disconnect_dsqld()
-{
-  client->close_connection();
-}
-
 void convert(char *data, int length, char **values, int nattrs) {
   int i = 0, idx = 0;
   values[idx] = data;
@@ -262,9 +221,43 @@ void convert(char *data, int length, char **values, int nattrs) {
   }
 }
 
-int get_insert_rows()
+long extract_num(const char *num_str)
+{
+  char num[20];
+  int idx = 0, i = 8;
+  if (strncmp(num_str, "Deleted", 7) != 0 && strncmp(num_str, "Updated", 7) != 0) {
+    cout << "extract wrong result" << num_str <<  endl;
+    return -1;
+  }
+  while(num_str[i] != ' ') {
+    num[idx++] = num_str[i++];
+  }
+  num[idx++] = '\0';
+  return atol(num);
+}
+
+long get_deletedUpdated_rows()
+{
+  const char* num_str = NULL;
+
+  res = client->fetch_result();
+  num_str = res.data[0].c_str();
+  return extract_num(num_str);
+}
+
+int get_inserted_rows()
 {
   return client->close_insert();
 }
 
+void connect_dsqld(char dsqldHostname[], int port)
+{
+  cout << "@@@@ connect which dsqld to send query:" << dsqldHostname << endl;
+  client = new DsqlClient(dsqldHostname, port);
+}
+
+void disconnect_dsqld()
+{
+  client->close_connection();
+}
 }

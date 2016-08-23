@@ -41,7 +41,7 @@ using namespace apache::thrift::protocol;
 using namespace apache::thrift::server;
 using namespace apache::thrift::transport;
 using namespace apache::thrift;
-using namespace std;
+//using namespace std;
 using namespace boost;
 
 namespace impala {
@@ -60,7 +60,6 @@ bool ThriftServer::Start() {
   shared_ptr<TTransportFactory> transport_factory(new TBufferedTransportFactory());
 
   TThreadedServer server(processor_, server_socket, transport_factory, protocol_factory);
-  cout << "server.server()" << endl;
   server.serve();
 
   return true;

@@ -301,7 +301,7 @@ CheckMyDatabase(const char *name, bool am_superuser)
 	 *
 	 * We do not enforce them for autovacuum worker processes either.
 	 */
-	if (IsUnderPostmaster && !IsAutoVacuumWorkerProcess())
+	if (IsUnderPostmaster && !IsAutoVacuumWorkerProcess() && !IsSyncMetaWorkerProcess())
 	{
 		/*
 		 * Check that the database is currently allowing connections.
@@ -684,7 +684,7 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 * In standalone mode and in autovacuum worker processes, we use a fixed
 	 * ID, otherwise we figure it out from the authenticated user name.
 	 */
-	if (bootstrap || IsAutoVacuumWorkerProcess())
+	if (bootstrap || IsAutoVacuumWorkerProcess() || IsSyncMetaWorkerProcess())
 	{
 		InitializeSessionUserIdStandalone();
 		am_superuser = true;

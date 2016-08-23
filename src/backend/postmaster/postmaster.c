@@ -413,6 +413,7 @@ static bool CreateOptsFile(int argc, char *argv[], char *fullprogname);
 static pid_t StartChildProcess(AuxProcType type);
 static void StartAutovacuumWorker(void);
 static void InitPostmasterDeathWatchHandle(void);
+static void StartSyncMetaWorker(void);
 
 /*
  * Archiver is allowed to start up at the current postmaster state?
@@ -5002,6 +5003,12 @@ sigusr1_handler(SIGNAL_ARGS)
 		signal_child(StartupPID, SIGUSR2);
 	}
 
+	if (CheckPostmasterSignal(PMSIGNAL_START_SYNCMETA_WORKER) &&
+		Shutdown == NoShutdown)
+	{
+		StartSyncMetaWorker();
+	}
+
 	PG_SETMASK(&UnBlockSig);
 
 	errno = save_errno;
@@ -5328,6 +5335,59 @@ StartAutovacuumWorker(void)
 	{
 		AutoVacWorkerFailed();
 		avlauncher_needs_signal = true;
+	}
+}
+
+/*
+ * StartSyncMetaWorker
+ *		Start an sync meta worker process.
+ *
+ * This function is here because it enters the resulting PID into the
+ * postmaster's private backends list.
+ *
+ * NB -- this code very roughly matches BackendStartup.
+ */
+static void
+StartSyncMetaWorker(void)
+{
+	Backend    *bn;
+
+	if (canAcceptConnections() == CAC_OK)
+	{
+		bn = (Backend *) malloc(sizeof(Backend));
+		if (bn)
+		{
+			MyCancelKey = PostmasterRandom();
+			bn->cancel_key = MyCancelKey;
+
+			/* SyncDb workers are not dead_end and need a child slot */
+			bn->dead_end = false;
+			bn->child_slot = MyPMChildSlot = AssignPostmasterChildSlot();
+			bn->bgworker_notify = false;
+
+			bn->pid = StartSyncDBWorker();
+			if (bn->pid > 0)
+			{
+				bn->bkend_type = BACKEND_TYPE_AUTOVAC;
+				dlist_push_head(&BackendList, &bn->elem);
+#ifdef EXEC_BACKEND
+				ShmemBackendArrayAdd(bn);
+#endif
+				/* all OK */
+				return;
+			}
+
+			/*
+			 * fork failed, fall through to report -- actual error message was
+			 * logged by StartSyncDbWorker
+			 */
+			(void) ReleasePostmasterChildSlot(bn->child_slot);
+			free(bn);
+		}
+		else
+			ereport(LOG,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory")));
 	}
 }
 
