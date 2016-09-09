@@ -19,7 +19,7 @@ include $(top_builddir)/src/Makefile.global
 
 SUBDIRS = access bootstrap catalog parser commands executor foreign gen-cpp lib libpq \
 	main nodes optimizer port postmaster regex replication rewrite \
-	storage tcop tsearch utils $(top_builddir)/src/timezone $(top_builddir)/src/interfaces/libpq statestore
+	storage tcop tsearch utils $(top_builddir)/src/timezone statestore
 
 include $(srcdir)/common.mk
 

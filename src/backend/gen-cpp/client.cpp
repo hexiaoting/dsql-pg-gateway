@@ -42,6 +42,7 @@ public:
       transport->open();
     } catch (...)
     {
+      cout << " new DsqlClient failed.****************";
     }
   }
 
@@ -53,11 +54,12 @@ public:
     while (true)
     {
       QueryState::type state = client->get_state(qhandle);
-      if (state == (QueryState::FINISHED))
+      if (state == QueryState::FINISHED)
         return 0;
-      else if (state == (QueryState::EXCEPTION)) {
+      else if (state == QueryState::EXCEPTION) {
         return -1;
       }
+      sleep(1);
     }
   }
 
@@ -66,7 +68,6 @@ public:
     Results   result;
     client->fetch(result, qhandle, false, FETCHCOUNT);
     if (result.has_more) {
-      // last parameter stands for Resultset_format is Binary
       while (true) {
         Results tmp;
         client->fetch(tmp, qhandle, false, FETCHCOUNT);
@@ -95,7 +96,6 @@ public:
         return get_warning_log();
       return NULL;
     }  catch (const TException& e) {
-      cerr <<  e.what();
       return (char *)(e.what());
     }
   }
@@ -252,7 +252,7 @@ int get_inserted_rows()
 
 void connect_dsqld(char dsqldHostname[], int port)
 {
-  cout << "@@@@ connect which dsqld to send query:" << dsqldHostname << endl;
+  cout << "@@@@ connect dsqld to send query:" << dsqldHostname << endl;
   client = new DsqlClient(dsqldHostname, port);
 }
 

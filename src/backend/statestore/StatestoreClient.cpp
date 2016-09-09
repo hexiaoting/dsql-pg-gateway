@@ -14,9 +14,9 @@ struct Meta *StatestoreClient::head = NULL;
 StatestoreClient* subscriber_client;
 
 extern "C" {
-  void create_context();
+  void dsql_create_context();
   void exec_dsql_query(const char *query_string, const char *db_name, int option);
-  void sync_meta_to_pg(struct Meta* head);
+  void dsql_process_metadata(struct Meta* head);
   void AddDsqldMember(DsqldNode *parsedNode);
   void ResetDsqldNodesHash();
 }
@@ -53,7 +53,7 @@ StatestoreClient::StatestoreClient(char *ip, int port)
     postMasterReady(false),
     lastSyncVersion_(0),
     thrift_iface_(new StatestoreSubscriberThriftIf(this)) {
-  create_context();
+  dsql_create_context();
   try {
     boost::shared_ptr<TTransport> socket(new TSocket(ip, port));
     transport = (boost::shared_ptr<TTransport>)new TBufferedTransport(socket);
@@ -353,7 +353,7 @@ struct Meta *StatestoreClient::FindOrInsertDb(const char *dbname) {
 void StatestoreClient::SyncMeta() {
   if (head == NULL)
     return ;
-  sync_meta_to_pg(head);
+  dsql_process_metadata(head);
   struct Meta *cur = head;
   struct Meta *tmp = NULL;
   while(cur != NULL) {
@@ -406,8 +406,4 @@ void StatestoreClient::ClearDbVec(vector<string> &vec) {
 
 void StatestoreClient::SetPort(int port) {
   pg_port = port;
-}
-
-long max(long a, long b) {
-  return a > b ? a : b;
 }
